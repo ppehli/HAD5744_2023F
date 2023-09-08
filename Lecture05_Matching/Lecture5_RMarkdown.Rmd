@@ -1,0 +1,319 @@
+---
+title: "Lecture 5 Code"
+author: "Alex Hoagland"
+date: "`r Sys.Date()`"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+```{r header}
+################################################################################
+# I like to include several additional notes in the header of my files here:
+#
+# Last modified: 8/11/2022
+#
+### PURPOSE:
+  # Lecture 5 code and output file
+# 
+### NOTES:
+  # - uses the Tidyverse package and Dplyr
+################################################################################
+
+
+### 0. Load the packages we will need for this file ####
+library(tidyverse) # load the installed package for each new session of R
+library(broom)
+library(readxl) # Read in data
+library(modelsummary) # For making regression tables
+library(causaldata) # Useful toy data sets
+library(here) # Helpful in working with directories and projects
+library(vtable) # For making balance tables
+library(MatchIt) # Main matching package
+
+set.seed(03262020) # Setting the seed helps to make random number generators give us the same numbers across machines
+################################################################################
+```
+
+## What if I don't match?
+
+Suppose that we are interested in the effect of having health insurance on total health expenditures. Let's load some sample data (don't forget to have your project set up so that `here()` knows where to look).
+
+```{r load-data}
+mydata <- read_xlsx(here("HealthExpenses.xlsx"))
+
+    # first, simple regression -- what is effect of insurance on expenses? 
+    m1 <- lm(expenses ~ coverage,data=mydata)
+    msummary(list(m1),
+             vcov=c("robust"),
+             stars=c('*' = .1, '**' = .05, '***' = .01))
+```
+ 
+ This would suggest that having coverage *increases* expenses! But there are important differences in treated and control groups that might make this an artifact of **selection**
+ 
+```{r viz-selection}
+    mydata %>% 
+      mutate(BMI1 = ifelse(coverage == 1,bmi,NA),
+             BMI2 = ifelse(coverage == 0,bmi,NA)) %>%
+      ggplot(aes(x=bmi) ) +
+      geom_density( aes(x = BMI1, y = ..density..), fill="#69b3a2") +
+      geom_label( aes(x=37, y=0.015, label="Treatment Group"), color="#69b3a2") +
+      geom_density( aes(x = BMI2, y = -..density..), fill= "#404080") +
+      geom_label( aes(x=25, y=-0.015, label="Control Group"), color="#404080") +
+      theme_minimal() +
+      geom_vline(xintercept = median(mydata[which(mydata$coverage==1),]$bmi),color = "#337E6E",size=2,linetype="dashed") + 
+      geom_vline(xintercept = median(mydata[which(mydata$coverage==0),]$bmi),color = "#944B8C",size=2,linetype="dashed") + 
+      labs(x="BMI",y="Density")
+
+    # Summary table of all baseline outcomes across groups
+sumtable(data=mydata,group="coverage",
+           vars=c("age","sex","bmi","children","smoker","expenses"),
+           digits=2,group.test=T)
+```
+
+## Subclassification example
+
+Let's start with matching based on a single variable: patient BMI. We first create bins of BMI that take it from a lot of variation into just a few categories (quantiles) from the disribution. 
+
+```{r subclassification}
+ggplot(mydata,aes(x=bmi)) + geom_density() + theme_minimal() # Lots of variation in BMI
+
+# First, create bins of BMI values by quintiles
+myquints <- unname(quantile(mydata$bmi,probs=c(0,.2,.4,.6,.8,1),na.rm=T))
+mydata <- mydata %>% mutate(bin = ifelse(bmi >= myquints[1] & bmi < myquints[2],1,
+                                   ifelse(bmi >= myquints[2] & bmi < myquints[3],2,
+                                    ifelse(bmi >= myquints[3] & bmi < myquints[4],3,
+                                     ifelse(bmi >= myquints[4] & bmi < myquints[5],4,5)))))
+mydata %>% ggplot(aes(x=bin)) + geom_histogram() + theme_classic()
+```
+
+In each bin, we then construct the differences in expenses between the insured and uninsured. This rests on the assumption that within each bin, there is no (less) selection between insurance status. We then weight these differences by the relative size of each group.
+
+```{r subclass-differences}
+# For each bin, construct the difference in expenses by insurance category 
+bin_means <- mydata %>% group_by(bin,coverage) %>% 
+  summarize(expenses = mean(expenses)) %>% 
+    # Creates bin/group means 
+group_by(bin) %>% summarize(diff = expenses[2] - expenses[1])
+bin_means %>% ggplot(aes(x=bin,y=diff)) + geom_point() # How do we interpret these? 
+
+# Create bins based on control group (uninsured)
+obs = nrow(mydata %>% filter(coverage == 0))
+
+wt1 <- mydata %>% 
+  filter(bin == 1 & coverage == 0) %>%
+  nrow(.)/obs
+
+wt2 <- mydata %>% 
+  filter(bin == 2 & coverage == 0) %>%
+  nrow(.)/obs
+
+wt3 <- mydata %>%
+  filter(bin == 3 & coverage == 0) %>%
+  nrow(.)/obs
+
+wt4 <- mydata %>% 
+  filter(bin == 4 & coverage == 0) %>%
+  nrow(.)/obs
+
+wt5 <- mydata %>% 
+  filter(bin == 5 & coverage == 0) %>%
+  nrow(.)/obs
+
+wtdiff <- as.numeric(bin_means[1,2]*wt1 + bin_means[2,2]*wt2 + bin_means[3,2]*wt3 + bin_means[4,2]*wt4 + bin_means[5,2]*wt5)
+bin_means %>% ggplot(aes(x=bin,y=diff)) + geom_point(size=2) + 
+  geom_hline(yintercept = wtdiff, linetype='dashed',color='blue') + 
+  theme_classic() + scale_y_continuous(labels=scales::dollar_format()) + 
+  labs(x="BMI Quantile", y="Spending Difference, Insured - Uninsured")
+```
+
+Using this adjustment changes the ATE from \$6,321 down to \$5,475. But have we dealt with all the selection? 
+
+### On your own: subclassification packages
+
+In case you are curious, there are helpful packages for subclassification matching. See this chunk below for an example
+
+```{r example-subclassification}
+  # Do this with package stratamatch (https://cran.r-project.org/web/packages/stratamatch/vignettes/Intro_to_stratamatch.html)
+  library(stratamatch)
+  library(optmatch) # Used for matching stratified data
+
+  m.strat <- manual_stratify(data=mydata,coverage ~ bin)
+  summary(m.strat)
+  m.strat$analysis_set # Analysis data
+  m.strat$issue_table # Any issues with strata
+  plot(m.strat, type = "hist", propensity = coverage ~ bin) # Look at propensity scores
+  mymatch <- strata_match(m.strat, coverage ~ bin, k = 1) # Match the data
+  summary(mymatch)
+  matched_data <- m.strat$analysis_set
+  matched_data$match <- as.character(mymatch)
+  matched_data %>% filter(!is.na(match)) %>% group_by(match) %>%
+    arrange(match,coverage) %>%
+    summarise(diff = expenses[2]-expenses[1]) %>%
+    ungroup() %>% summarize(mean = mean(diff)) # Matched differences are $5559, close to the method above
+
+  # We can add multiple variables
+  m.strat <- manual_stratify(data=mydata,coverage ~ bin + smoker + children)
+  summary(m.strat)
+  m.strat$analysis_set
+  m.strat$issue_table
+  plot(m.strat, type = "hist", propensity = coverage ~ bin + smoker + children)
+  mymatch <- strata_match(m.strat, coverage ~ bin + smoker + children, k = 1) # Match the data
+  summary(mymatch)
+  matched_data <- m.strat$analysis_set
+  matched_data$match <- as.character(mymatch)
+  matched_data %>% filter(!is.na(match)) %>% group_by(match) %>%
+    arrange(match,coverage) %>%
+    summarise(diff = expenses[2]-expenses[1]) %>%
+    ungroup() %>% summarize(mean = mean(diff)) # Now, matched differences go all the way down to -$45.8!
+```
+
+## Exact matching: Multiple Variables
+
+Let's expand beyond just BMI to include multiple variables (for now, just throw in the number of children in a household and if the enrollee is a smoker). First, we'll look at exact matches only. 
+
+```{r exact-1}
+treated <- mydata %>% filter(coverage == 1)
+control <- mydata %>% filter(coverage == 0)
+matched_data <- inner_join(treated,control,by=c('bmi','children','smoker'))
+matched_data %>% mutate(diff = expenses.x-expenses.y) %>% 
+  group_by(bmi,children,smoker) %>% # Create one average per cell
+  summarize(diff = mean(diff), nobs = n()) %>% 
+  ungroup() %>% # Now overall (weighted) average
+  summarize(diff = weighted.mean(diff,nobs)) # Estimated effect of insurance: $42
+```
+
+Now, the estimated effect of insurance has dropped to a \$42 increase in expenditures. But notice how much our sample size has been reduced! 
+
+We can get around this a little bit by not doing exact matching on a continuous variable (BMI) -- let's discretize it. 
+
+```{r exact-2}
+matched_data <- inner_join(treated,control,by=c('bin','children','smoker'))
+matched_data %>% mutate(diff = expenses.x-expenses.y) %>% 
+  group_by(bin,children,smoker) %>% # Create one average per cell
+  summarize(diff = mean(diff), nobs=n()) %>% 
+  ungroup() %>% # Now overall average
+  summarize(diff = weighted.mean(diff,nobs)) # Estimated effect of insurance: +$155
+```
+
+Now, we're doing a huge many-to-many match! Do we really believe that all of these can be compared? Luckily, it doesn't change the estimate too much. 
+
+## Nearest Neighbor Matching
+
+So let's expand the criteria to nearest neighbor matching. We will match on a larger range of covariates now: 
+* Enrollee age
+* Enrollee sex
+* Enrollee BMI
+* # of children
+* Smoker status
+* Region of residence
+
+```{r nn-1}
+mydata <- mydata %>% mutate(region_ne = ifelse(region == "northeast",1,0),
+                            region_nw = ifelse(region == "northwest",1,0),
+                            region_se = ifelse(region == "southeast",1,0), 
+                                # Create 3 dummy variables for the 4 regions
+                            female = (ifelse(sex == "female",1,0)))  
+
+mymatches_nn <- matchit(coverage ~ age + female + bmi + children + smoker + region_ne + region_nw + region_se, 
+                     data=mydata,
+                     method='nearest', # Matching method -- see ?matchit
+                     distance='scaled_euclidean', # metric for distance
+                     replace=TRUE, # do we use replacements in matches?
+                     ratio=10, # how many matches are we looking for?
+                     verbose=TRUE) # print output of package process
+summary(mymatches_nn) # Look at new balance and sample size
+# View(mymatches_nn) # Look at objects returned if you want
+```
+
+Now that we have matched the data, we can estimate our model just as a difference in means: 
+```{r nn-2}
+regdata_nn <- match.data(mymatches_nn)
+nn_match <- lm(expenses ~ coverage,
+               data = regdata_nn,
+               weights=weights)
+msummary(list("OLS"=m1, "Nearest Neighbor"=nn_match),
+         vcov=c(~region,~region),
+         stars=c('*' = .1, '**' = .05, '***' = .01))
+``` 
+
+Now, coverage is associated with an increase of \$2,029. 
+
+## Propensity score matching
+
+Finally, how might we implement propensity score matching in our scenario? We can use the same package (which is very versatile)
+
+```{r psm-1}
+mymatches_psm <- matchit(coverage ~ age + female + bmi + children + smoker + region_ne + region_nw + region_se, # Matching regression
+                     data=mydata,
+                     method='nearest', # Matching method -- see ?matchit
+                     distance='glm', # generalized linear model for propensity
+                     replace=TRUE, # do we use replacements in matches?
+                     verbose=TRUE) # print output of package process
+summary(mymatches_psm) # Look at new balance and sample size
+```
+
+When using propensity score matching, we need to make sure that our **common support assumption** holds in practice, so that we are truly (starting to) match(ing) in an appropriate way. We can test this visually: 
+
+```{r psm-2} 
+regdata_psm <- match.data(mymatches_psm)
+hist(regdata_psm$distance) # Look at overall distribution of propensity scores
+
+# Test common support assumption 
+ggplot(regdata_psm,aes(x=distance, fill = factor(coverage))) + 
+  geom_histogram(binwidth = .05,color='black') + 
+  theme_minimal() + 
+  labs(x="Propensity Score", y="Count",fill="Coverage") # What should we be looking for here? 
+```
+
+It looks like our common support assumption won't be a problem here. Hence, we can run our regression: 
+```{r psm-3}
+ps_match <- lm(expenses ~ coverage,
+               data = regdata_psm,
+               weights=1/distance) 
+msummary(list("OLS"=m1, "Nearest Neighbor"=nn_match, "Propensity Score"=ps_match),
+         stars=c('*' = .1, '**' = .05, '***' = .01))
+```
+
+## Matching Best Practices
+
+Here are some code chunks for best practices, including: 
+* Making a balance table
+* Testing common support (copied from above)
+* Trimming low-quality matches (shown here for PSM matching)
+
+```{r best-practices}
+# Balance table
+sumtable(data=mydata,group="coverage",group.test=TRUE,title="Unmatched Sample") 
+sumtable(data=regdata_psm,group="coverage",group.test=TRUE,title="Matched Sample",
+         group.weights="weights")
+# TODO: add a better sumtable here
+                     
+
+# Common support (copied from above)
+ggplot(regdata_psm,aes(x=distance, fill = factor(coverage))) + 
+  geom_histogram(binwidth = .05,color='black') + 
+  theme_minimal() + 
+  labs(x="Propensity Score", y="Count",fill="Coverage")
+
+# Trim observations with high/low propensity scores
+ps_match_trim <- lm(expenses ~ coverage, # + age + female + bmi +children + smoker + region_ne + region_nw + region_se,
+               data = regdata_psm[which(regdata_psm$distance>.05 & regdata_psm$distance<.95),],
+               weights=1/distance) 
+msummary(list("OLS"=m1, "Nearest Neighbor"=nn_match, "Propensity Score"=ps_match, "Trimmed Propensity Score"=ps_match_trim),
+         stars=c('*' = .1, '**' = .05, '***' = .01))
+```
+
+## Package Citations
+```{r, include=FALSE}
+print("=============================Works Cited=============================")
+loadedNamespaces() %>%
+map(citation) %>%
+print(style = "text") # Adds citations for each package to end of .rmd file
+
+knitr::write_bib(file = 'packages.bib') # Constructs a citation file for all packages used in this lecture.
+
+# DON'T FORGET TO CITE YOUR PACKAGES IN YOUR PAPERS/ASSIGNMENTS. 
+```

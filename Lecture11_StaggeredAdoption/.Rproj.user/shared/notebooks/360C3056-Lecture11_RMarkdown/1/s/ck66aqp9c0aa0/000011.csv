@@ -1,0 +1,5 @@
+"0","pols <- lm(logy ~ factor(cohortid) + factor(timeid) + factor(cohortid):factor(timeid), 
+           data=regdata_dte)
+"
+"2","Error in factor(timeid) : object 'timeid' not found
+"
