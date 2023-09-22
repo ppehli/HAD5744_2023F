@@ -1,0 +1,3 @@
+# here is the mean between two values. 
+mean(c(0,0.5))
+x <- 0.26
